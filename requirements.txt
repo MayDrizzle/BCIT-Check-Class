@@ -4,5 +4,6 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 python-dateutil==2.9.0.post0
 lxml==5.2.2
-pandas==2.2.3rc0  # optional; remove if you don’t want it
+pandas==2.2.3  # optional; remove if you don’t want it
+
 
