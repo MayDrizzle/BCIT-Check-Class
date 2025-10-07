@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: bcit-monitor
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 1 -k gthread -t 120 --bind 0.0.0.0:$PORT app:app"
+    healthCheckPath: "/health"
+    envVars:
+      - key: RECIPIENTS
+        value: "jamesalexdownie@gmail.com,maxwelldownie@gmail.com"
+      - key: SMTP_SERVER
+        value: "smtp.gmail.com"
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
