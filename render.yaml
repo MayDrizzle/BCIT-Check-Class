@@ -3,10 +3,26 @@ services:
     name: bcit-monitor
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn -w 1 -k gthread -t 120 --bind 0.0.0.0:$PORT app:app"
-    healthCheckPath: "/health"
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: >
+      gunicorn -w 1 -k gthread -t 120
+      --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: "/test"   # Render's internal health ping; keep /health for *your* scraper health
+    autoDeploy: true
+
     envVars:
+      # Core behavior
+      - key: BCIT_URL
+        value: "https://www.bcit.ca/apprenticeship/students/training/carpentry-apprentice-harmonized/"
+      - key: TARGET_LEVEL
+        value: "Level 04"
+      - key: SPECIFIC_INTAKE_KEYWORDS
+        value: "Jan 05|Feb 20, 2026"   # pipe-separated
+
+      # Email (set USER/PASS securely in dashboard)
+      - key: EMAIL_ALERT
+        value: "true"
       - key: RECIPIENTS
         value: "jamesalexdownie@gmail.com,maxwelldownie@gmail.com"
       - key: SMTP_SERVER
@@ -14,6 +30,18 @@ services:
       - key: SMTP_PORT
         value: "587"
       - key: SMTP_USER
-        sync: false
+        sync: false   # set in Render dashboard
       - key: SMTP_PASS
-        sync: false
+        sync: false   # set in Render dashboard
+
+      # Test token to protect /smtp-test and /scrape-and-email
+      - key: TEST_TOKEN
+        sync: false   # set in Render dashboard, e.g., a long random string
+
+      # Tuning (optional)
+      - key: CHECK_INTERVAL_SEC
+        value: "1800"   # scrape every 30 min
+      - key: STALE_AFTER_SEC
+        value: "1800"   # /health returns 500 if >30 min since last success
+      - key: CHECK_PRE_APRIL_YEAR
+        value: "2026"
