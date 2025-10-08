@@ -9,11 +9,17 @@ import time
 from datetime import datetime
 import re
 import smtplib
-from email.mime.text import MIMEText
+from email.mime.text import MIMEText  # kept for compatibility (unused on Render free)
 from dateutil import parser as date_parser
 import os
 import random
 from typing import List, Dict, Any, Optional
+
+# Optional pandas fallback (safe if not installed)
+try:
+    import pandas as pd  # noqa: F401
+except Exception:
+    pd = None  # type: ignore
 
 # =========================
 # Config (env-first)
@@ -29,12 +35,21 @@ SPECIFIC_INTAKE_KEYWORDS = os.getenv(
 ).split("|")
 CHECK_PRE_APRIL_YEAR = int(os.getenv("CHECK_PRE_APRIL_YEAR", "2026"))
 
-# Email
+# Email (Mailjet by default; SMTP vars left for compatibility)
 EMAIL_ALERT = os.getenv("EMAIL_ALERT", "true").lower() == "true"
 RECIPIENTS = [e.strip() for e in os.getenv(
     "RECIPIENTS",
     "jamesalexdownie@gmail.com,maxwelldownie@gmail.com"
 ).split(",") if e.strip()]
+
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "mailjet").lower()
+
+# Mailjet HTTPS API (works on Render free)
+MAILJET_API_KEY = os.getenv("MAILJET_API_KEY", "")
+MAILJET_API_SECRET = os.getenv("MAILJET_API_SECRET", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "alerts@example.com")
+
+# (Legacy SMTP — blocked on Render free, but kept here for completeness)
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -58,7 +73,7 @@ STALE_AFTER_SEC = int(os.getenv("STALE_AFTER_SEC", "1800"))         # health 500
 app = Flask(__name__)
 
 def _log(msg: str) -> None:
-    # Uniform, timestamped logging
+    # Uniform, timestamped UTC logging
     print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}Z] {msg}", flush=True)
 
 @app.route("/")
@@ -90,6 +105,7 @@ def level4_listing():
         "date_text": "...",
         "start_date_iso": "YYYY-MM-DD",
         "end_date_iso": "YYYY-MM-DD",
+        "year": 2026,
         "seats_left": 6 | null,
         "is_full": true/false
       }, ...
@@ -103,13 +119,15 @@ def level4_listing():
         _log(f"/level4 ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/smtp-test")
-def smtp_test():
+@app.route("/email-test")
+def email_test():
+    # Simple protected endpoint to test email delivery
     if not _is_allowed():
         return "Forbidden", 403
-    ok, info = send_plain(
-        subject="SMTP Test ✅",
-        body=f"Hello from BCIT monitor at {datetime.now().isoformat()}.\nThis verifies SMTP config."
+    ok, info = send_email(
+        "Email API Test ✅",
+        f"Hello from BCIT monitor at {datetime.now().isoformat()}",
+        RECIPIENTS
     )
     return (f"OK: {info}", 200) if ok else (f"ERROR: {info}", 500)
 
@@ -127,20 +145,53 @@ def scrape_and_email():
         f"Health age (sec): {int(time_since_last_success())}\n"
         f"URL checked: {URL}\n"
     )
-    ok, info = send_plain(subject, body)
+    ok, info = send_email(subject, body, RECIPIENTS)
     return (f"OK: {info}\n\n{result_text}\n", 200) if ok else (f"ERROR: {info}\n\n{result_text}\n", 500)
 
 # =========================
-# Email helpers
+# Email senders
 # =========================
-def send_plain(subject: str, body: str, to_list: Optional[List[str]] = None) -> (bool, str):
-    to_list = to_list or RECIPIENTS
+import requests  # after Flask import to avoid shadowing
+
+def _send_via_mailjet(subject: str, body: str, to_list: list[str]) -> tuple[bool, str]:
+    """
+    Mailjet v3.1 Send API (HTTPS) — works on Render free tier.
+    Docs: https://dev.mailjet.com/email/guides/send-api-v31/
+    """
+    if not (MAILJET_API_KEY and MAILJET_API_SECRET):
+        return False, "Mailjet API credentials missing"
+    try:
+        r = requests.post(
+            "https://api.mailjet.com/v3.1/send",
+            auth=(MAILJET_API_KEY, MAILJET_API_SECRET),
+            json={
+                "Messages": [{
+                    "From": {"Email": FROM_EMAIL},
+                    "To": [{"Email": e} for e in to_list],
+                    "Subject": subject,
+                    "TextPart": body
+                }]
+            },
+            timeout=20,
+        )
+        if 200 <= r.status_code < 300:
+            data = r.json()
+            status = (data.get("Messages") or [{}])[0].get("Status", "").lower()
+            if status == "success":
+                return True, "sent"
+            return False, f"API responded but not success: {data}"
+        return False, f"{r.status_code} {r.text}"
+    except Exception as e:
+        return False, str(e)
+
+def _send_via_smtp(subject: str, body: str, to_list: list[str]) -> tuple[bool, str]:
+    """Legacy SMTP path (blocked on Render free; OK elsewhere)."""
+    if not (SMTP_USER and SMTP_PASS):
+        return False, "SMTP_USER / SMTP_PASS not set"
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = ", ".join(to_list)
-    if not SMTP_USER or not SMTP_PASS:
-        return False, "SMTP_USER / SMTP_PASS not set"
     try:
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20)
         server.starttls()
@@ -149,8 +200,16 @@ def send_plain(subject: str, body: str, to_list: Optional[List[str]] = None) -> 
         server.quit()
         return True, "sent"
     except Exception as e:
-        _log(f"❌ SMTP send failed: {e}")
         return False, str(e)
+
+def send_email(subject: str, body: str, to_list: list[str]) -> tuple[bool, str]:
+    """Provider-agnostic email sender."""
+    provider = EMAIL_PROVIDER
+    if provider == "mailjet":
+        return _send_via_mailjet(subject, body, to_list)
+    elif provider == "smtp":
+        return _send_via_smtp(subject, body, to_list)
+    return False, "Unsupported EMAIL_PROVIDER (set EMAIL_PROVIDER=mailjet or smtp)"
 
 def send_alert(msg: str, subject_override: Optional[str] = None) -> None:
     if not EMAIL_ALERT:
@@ -158,7 +217,7 @@ def send_alert(msg: str, subject_override: Optional[str] = None) -> None:
         return
     subject = subject_override or f"{TARGET_LEVEL} Seat Alert! 🎉"
     body = f"BCIT Update:\n\n{msg}\n\nCheck: {URL}"
-    ok, info = send_plain(subject, body)
+    ok, info = send_email(subject, body, RECIPIENTS)
     _log(f"send_alert -> {('OK' if ok else 'ERROR')} {info}")
 
 # =========================
@@ -243,14 +302,12 @@ def parse_date_span(date_text: str) -> (Optional[datetime], Optional[datetime], 
     cleaned = re.sub(r'\s+', ' ', date_text.strip().replace('\n', ' '))
     cleaned = re.sub(r',(?!\s)', ', ', cleaned)
 
-    # Common "X to Y, YEAR"
     m = re.match(r'(\w+\s+\d{1,2})\s+to\s+(\w+\s+\d{1,2}),\s*(\d{4})', cleaned)
     if m:
         start = date_parser.parse(f"{m.group(1)} {m.group(3)}")
         end = date_parser.parse(f"{m.group(2)} {m.group(3)}")
         return start, end, int(m.group(3))
 
-    # Single date or other simple forms: take the first date in the string
     try:
         first = cleaned.split(' to ')[0] if ' to ' in cleaned else cleaned
         dt = date_parser.parse(first)
@@ -259,7 +316,6 @@ def parse_date_span(date_text: str) -> (Optional[datetime], Optional[datetime], 
         return None, None, None
 
 def _extract_seats(status_text: str) -> Optional[int]:
-    # Try to find "N seats left" patterns
     m = re.search(r'(\d+)\s+seats?\s+left', status_text, re.I)
     if m:
         return int(m.group(1))
@@ -279,6 +335,22 @@ def find_level_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     for t in soup.find_all("table"):
         if DATE_RX.search(t.get_text(" ", strip=True)):
             return t
+    # 3) pandas salvage (if available)
+    if pd is not None:
+        try:
+            dfs = pd.read_html(str(soup))
+            for df in dfs:
+                if df.shape[1] >= 2:
+                    contains_dates = bool(
+                        df.astype(str)
+                          .apply(lambda col: col.str.contains(DATE_RX, na=False).any(), axis=0)
+                          .any()
+                    )
+                    if contains_dates:
+                        return BeautifulSoup(df.to_html(index=False), "html.parser").find("table")
+        except Exception as e:
+            if DEBUG:
+                _log(f"DEBUG: pandas.read_html failed: {e}")
     return None
 
 def scrape_level4_rows(html: str) -> List[Dict[str, Any]]:
@@ -322,7 +394,6 @@ def summarize_result(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     pre_april_opens: List[str] = []
 
     for rec in records:
-        # future intakes only
         start_iso = rec.get("start_date_iso")
         if not start_iso:
             continue
@@ -333,7 +404,6 @@ def summarize_result(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         if start_dt <= now_dt:
             continue
 
-        # Check specific target intakes by keywords
         date_text = rec["date_text"]
         if any(k in date_text for k in SPECIFIC_INTAKE_KEYWORDS):
             if rec["is_full"]:
@@ -343,12 +413,10 @@ def summarize_result(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 specific_statuses.append("UNKNOWN")
 
-        # Pre-April opens for the configured year
         if start_dt.year == CHECK_PRE_APRIL_YEAR and start_dt.month <= 3:
             if (rec.get("seats_left") is not None) or ("seats left" in rec["status_text"].lower()):
                 pre_april_opens.append(f"{date_text}: {rec['status_text']}")
 
-    # Roll up specific statuses
     if specific_statuses:
         uq = set(specific_statuses)
         specific_status = list(uq)[0] if len(uq) == 1 else "MIXED"
@@ -382,40 +450,43 @@ def run_check_once() -> (str, str):
         update_status_file()
         set_failure_count(0)
 
-        # Build human string for logs & email
         result_text = f"{TARGET_LEVEL} summary: {summary['specific_status']} for target intake(s). {summary['pre_april_msg']}"
 
-        # Log the parsed top lines to help you verify accuracy
+        # Log parsed top lines for visibility
         recent_lines = []
         for rec in records[:8]:
             recent_lines.append(
-                f"- {rec['date_text']}  |  status='{rec['status_text']}'  "
-                f"start={rec['start_date_iso']} end={rec['end_date_iso']} seats={rec['seats_left']} full={rec['is_full']}"
+                f"- {rec['date_text']} | status='{rec['status_text']}' "
+                f"start={rec['start_date_iso']} end={rec['end_date_iso']} "
+                f"seats={rec['seats_left']} full={rec['is_full']}"
             )
         log_block = "\n".join(recent_lines) if recent_lines else "(no rows parsed)"
         full_summary = (
             f"Parsed {len(records)} rows.\n"
-            f"Specific: {summary['specific_status']}  |  {summary['pre_april_msg']}\n"
+            f"Specific: {summary['specific_status']} | {summary['pre_april_msg']}\n"
             f"Sample:\n{log_block}"
         )
         _log(f"CHECK RESULT\n{full_summary}")
 
         # Send seat alert if anything is open
         if "OPEN" in summary["specific_status"] or summary["pre_april_list"]:
-            send_alert(f"🚨 {TARGET_LEVEL} Alert: {summary['specific_status']} for target intake(s)! {summary['pre_april_msg']}")
+            send_alert(
+                f"🚨 {TARGET_LEVEL} Alert: {summary['specific_status']} for target intake(s)! "
+                f"{summary['pre_april_msg']}"
+            )
 
         return result_text, full_summary
 
     except Exception as e:
-        # failure path
         n = get_failure_count() + 1
         set_failure_count(n)
         _log(f"❌ Error in monitor: {e} (consecutive={n})")
 
-        # only email on persistent failure to avoid noise
         if n >= 3:
-            send_alert(f"❌ Error in monitor: {e} (consecutive={n})", subject_override="❗ BCIT Monitor Error (persistent)")
-        # do NOT update_status_file() on failure (keeps /health meaningful)
+            send_alert(
+                f"❌ Error in monitor: {e} (consecutive={n})",
+                subject_override="❗ BCIT Monitor Error (persistent)"
+            )
         return f"❌ Error: {e}", f"Failure (consecutive={n})"
 
 # =========================
@@ -447,4 +518,4 @@ def _start_monitor_once():
 _start_monitor_once()
 
 # Export Flask app object for Gunicorn
-# gunicorn -w 1 -k gthread --bind 0.0.0.0:$PORT app:app
+# Run: gunicorn -w 1 -k gthread --bind 0.0.0.0:$PORT app:app
